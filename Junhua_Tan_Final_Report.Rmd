@@ -1,0 +1,695 @@
+---
+title: "Final Project Long EDA Report"
+author: "Junhua Tan"
+date: "03/15/2020"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    highlight: "tango"
+    code_folding: hide
+    df_print: paged
+---
+
+
+# Introduction
+This data was published by UC Irvine Machine Learning Repository in 1988 for the purpose of training a  model in which predict the presence of heart disease in the patient(data source: Janosi A., Steinbrunn W., M.D. (2019). UCI Machine Learning Repository [https://archive.ics.uci.edu/ml/datasets/Heart+Disease]. Irvine, CA: University of California, School of Information and Computer Science.). With this information, the researchers hope to help doctors to quickly make quicker, better judgement and provide care needed for patients. The data folder contains 1 csv file with 303 instances of 75 attributes. However, for our purpose of this final project, I will use only a subset of 14 attributes like all published experiments with this dataset did. In the future I might also consider incorporating additional attributes to provide a better summary of the disease.
+
+---
+
+## Set-up
+1) Load libraries
+```{r Load libraries, message=FALSE, warning=FALSE}
+# Loading package(s)
+library(MASS)
+library(tidyverse)
+library(GGally)
+library(janitor)
+library(skimr)
+library(corrplot)
+library(modelr)
+library(broom)
+library(glmnet)
+library(leaps)
+```
+
+2) Set Seed
+```{r Set Seed, warning=FALSE, message=FALSE}
+RNGversion("3.5")
+set.seed(27183)
+```
+
+3) Read processed dataset
+```{r Read processed dataset}
+# Read processed dataset
+train <- read_csv(
+  "data/processed/heart_train.csv",
+  col_types = cols(
+    age = col_double(),
+    sex = col_factor(),
+    cp = col_factor(),
+    trestbps = col_double(),
+    chol = col_double(),
+    fbs = col_factor(),
+    restecg = col_factor(),
+    thalach = col_double(),
+    exang = col_factor(),
+    oldpeak = col_double(),
+    slope = col_factor(),
+    ca = col_factor(),
+    thal = col_factor(),
+    target = col_factor()
+  )) %>% 
+  clean_names()
+
+test <- read_csv(
+  "data/processed/heart_test.csv",
+  col_types = cols(
+    age = col_double(),
+    sex = col_factor(),
+    cp = col_factor(),
+    trestbps = col_double(),
+    chol = col_double(),
+    fbs = col_factor(),
+    restecg = col_factor(),
+    thalach = col_double(),
+    exang = col_factor(),
+    oldpeak = col_double(),
+    slope = col_factor(),
+    ca = col_factor(),
+    thal = col_factor(),
+    target = col_factor()
+  )) %>% 
+  clean_names()
+```
+
+4) View proportion of response variable in training data.
+```{r}
+train %>% 
+  skim_without_charts()
+
+# Proportions of Patient with Heart Disease
+train %>% 
+  count(target) %>% 
+  mutate(prop = n/sum(n))
+```
+We have over 50% of data with patients diagnosed with heart diseases, which may implies an potential bias in our dataset.
+
+---
+
+## Best subset variable selection
+
+### Create train and test tibble
+```{r}
+heart_db <- tibble(
+  train = train %>% list(),
+  test = test %>% list())
+```
+
+### Ridge
+```{r}
+# lambda grid to search -- use for ridge regression (200 values)
+lambda_grid <- 10^seq(-2, 10, length = 200)
+
+# ridge regression: 10-fold cv
+ridge_cv <- heart_db %>% 
+  pluck("train", 1) %>% 
+  glmnetUtils::cv.glmnet(
+    formula = target ~ ., 
+    data = .,
+    alpha = 0, # for ridge regression
+    nfolds = 10,
+    lambda = lambda_grid,
+    family = "binomial"
+  )
+
+# Check plot of cv error
+plot(ridge_cv)
+
+# ridge's best lambdas
+ridge_lambda_min <- ridge_cv$lambda.min
+ridge_lambda_1se <- ridge_cv$lambda.1se
+```
+
+### Lasso
+```{r}
+# lasso: 10-fold cv
+lasso_cv <- heart_db %>% 
+  pluck("train", 1) %>% 
+  glmnetUtils::cv.glmnet(
+    formula = target ~ . , 
+    data = ., 
+    alpha = 1, 
+    nfolds = 10,
+    family = "binomial"
+  )
+
+plot(lasso_cv)
+
+# lasso's best lambdas
+lasso_lambda_1se <- lasso_cv$lambda.1se
+lasso_lambda_min <- lasso_cv$lambda.min
+```
+
+### Comparison
+From Ridge and Lasso result, we can see that variables such as the sex of the patient (`sex`), the presence and type of chest pain if any (`cp`), resting electrocardiographic results (`restecg`), exercise induced angina (`exang`), the slope of the peak exercise ST segment (`slope`), ST depression induced by exercise relative to rest (`oldpeak`), number of major vessels (0-4) colored by flourosopy (`ca`) and heart condition (`thal`) are generally picked up as significant by all four models with ridge and lasso lambdas that produce the smallest test error and the lambda within 1 standard error of that best lambda.
+
+```{r}
+x <- model.matrix(target~., train)[,-1]
+y <- train$target
+
+heart_glmnet <- tibble(train = heart_db$train,
+                        test  = heart_db$test) %>%
+  mutate(ridge_min = map(train, ~ glmnet(x, y, data = .x,
+                                         alpha = 0, lambda = ridge_lambda_min,
+                                         family="binomial")),
+         ridge_1se = map(train, ~ glmnet(x, y, data = .x,
+                                         alpha = 0, lambda = ridge_lambda_1se,
+                                         family="binomial")),
+         lasso_min = map(train, ~ glmnet(x, y, data = .x,
+                                         alpha = 1, lambda = lasso_lambda_min,
+                                         family="binomial")),
+         lasso_1se = map(train, ~ glmnet(x, y, data = .x,
+                                         alpha = 1, lambda = lasso_lambda_1se,
+                                         family="binomial"))) %>% 
+  pivot_longer(cols = c(-test, -train), names_to = "method", values_to = "fit")
+
+# Inspect/compare model coefficients 
+heart_glmnet %>% 
+  pluck("fit") %>% 
+  map( ~ coef(.x) %>% 
+         as.matrix() %>% 
+         as.data.frame() %>% 
+         rownames_to_column("name")) %>%
+  reduce(full_join, by = "name") %>% 
+  mutate_if(is.double, ~ if_else(. == 0, NA_real_, .)) %>% 
+  rename(ridge_min = s0.x,
+         ridge_1se = s0.y,
+         lasso_min = s0.x.x,
+         lasso_1se = s0.y.y) %>% 
+  knitr::kable(digits = 3)
+```
+
+---
+
+## Model Building
+Here, we compare three models with each methods: 1) using all variables in the dataset, 2) using theoretically important variables explored in EDA, 3) using variables from the ridge and lasso best subset selection.
+
+### Generalized Linear Model
+
+Model 2 with theoretically important variables explored in EDA produced the smallest test error of 0.233 using generalized linear model.
+
+```{r}
+# Helper function for calculating error rate
+error_rate_glm <- function(data, model){
+  data %>% 
+    mutate(pred_prob = predict(model, newdata = data, type = "response"),
+           pred_target = if_else(pred_prob > 0.5, "0", "1"),
+           error = pred_target != target) %>% 
+    pull(error) %>% 
+    mean()
+}
+
+# Helper function for confusion matrix
+confusion_mat_glm <- function(data, model){
+  data %>% 
+    mutate(pred_prob = predict(model, newdata = data, type = "response"),
+           pred_target = if_else(pred_prob > 0.5, "0", "1")) %>% 
+    count(target, pred_target) %>% 
+    mutate(prop = n / sum(n))
+}
+```
+
+```{r}
+glm_fits <- heart_db %>% 
+  mutate(mod_01 = map(train, glm, 
+                      formula = target ~ .,
+                      family = binomial),
+         mod_02 = map(train, glm, 
+                      formula = target ~ age + sex + cp + thalach + exang + oldpeak,
+                      family = binomial),
+         mod_03 = map(train, glm, 
+                      formula = target ~ sex + cp + restecg + exang + oldpeak + slope + ca + thal,
+                      family = binomial)) %>% 
+  pivot_longer(cols = contains("mod_"), names_to = "model_name", values_to =  "model_fit")
+
+# Calculate model error
+glm_fits <- glm_fits %>% 
+  mutate(train_error = map2_dbl(train, model_fit, error_rate_glm),
+         test_error  = map2_dbl(test, model_fit, error_rate_glm),
+         test_confusion = map2(test, model_fit, confusion_mat_glm))  
+  
+glm_fits %>% 
+  dplyr::select(model_name, train_error, test_error) %>% 
+  arrange(test_error) %>% 
+  knitr::kable()
+```
+
+### KNN
+
+Model 3 produced the smallest test error of 0.233 using KNN with folds of 5.
+
+```{r}
+#### Helper Functions
+
+# tidy wrapper function for knn
+knn_tidy <- function(train, test, pred_vars, response_var, ...){
+  train_reduced <- train %>% dplyr::select(!!pred_vars) %>% as.matrix()
+  test_reduced  <- test %>% dplyr::select(!!pred_vars) %>% as.matrix()
+  train_class   <- train %>% dplyr::select(!!response_var) %>% as.matrix()
+ 
+  preds <- class::knn(train = train_reduced, 
+                      test = test_reduced, 
+                      cl = train_class, ...) 
+  
+  pred_name <- paste0("pred_", response_var)
+  tibble(!!pred_name := preds)
+}
+
+# Function to calculate knn error rate 
+error_rate_knn <- function(data, pred_value){
+  data %>%
+    bind_cols(pred_value) %>% 
+    mutate(error = target != pred_target) %>% 
+    pull(error) %>% 
+    mean()
+}
+
+# Function to form knn confusion matrix
+confusion_mat_knn <- function(data, pred_value){
+  data %>%
+    bind_cols(pred_value) %>% 
+    count(target, pred_target) %>% 
+    mutate(prop = n / sum(n))
+}
+```
+
+```{r}
+# Set-up tibble with predictor vars
+pred_var <- tibble(pred_set = list(c("age", "sex", "cp", "thalach",
+                                     "trestbps", "chol", "fbs", "restecg",
+                                     "exang", "oldpeak", "slope", "ca", "thal"), 
+                                   c("age", "sex", "cp", "thalach", "oldpeak",
+                                     "exang"),
+                                   c("sex", "cp", "restecg", "exang", "oldpeak",
+                                     "slope", "ca", "thal")))
+
+# Set-up tibble with num of neighbors (k)
+k_values <- tibble(k_value = c(1, 2, 5, 10, 15))
+
+# Set-up tibble with model fitting info & fit to test dataset
+knn_fits <- heart_db %>% 
+  crossing(k_values) %>% 
+  crossing(pred_var) %>% 
+  mutate(knn_preds = pmap(list(train, test, pred_set,"target", k_value),
+                          knn_tidy))
+
+# update knn_fits with error and confusion info
+knn_fits <- knn_fits %>% 
+  mutate(test_error = map2_dbl(test, knn_preds, error_rate_knn),
+         test_confusion = map2(test, knn_preds, confusion_mat_knn)) 
+  
+# Compare models by test_error
+knn_fits %>% 
+  dplyr::select(pred_set, k_value, test_error) %>% 
+  mutate(pred_set = map_chr(pred_set, ~ str_c(.x, collapse = ", " ))) %>% 
+  arrange(test_error) %>% 
+  knitr::kable()
+```
+
+### LDA Model
+
+Model 2 with theoretically important variables explored in EDA produced the smallest test error of 0.233 using LDA. The confusion matrix shows that the model is generally good at predicting patients with heart disease with (10/11 cases) but tends to over-estimate the patients who do not have heart disease as they do (6/19).
+
+```{r}
+# Helper function for calculating lda error rate 
+error_rate_lda <- function(data, model){
+  data %>% 
+    mutate(pred_target = predict(model, newdata = data) %>% 
+             pluck("class"),
+           error = pred_target != target) %>% 
+    pull(error) %>% 
+    mean()
+}
+
+# Helper function for lda confusion matrix
+confusion_mat_lda <- function(data, model){
+  data %>% 
+    mutate(pred_target = predict(model, newdata = data) %>% 
+             pluck("class")) %>% 
+    count(target, pred_target) %>% 
+    mutate(prop = n / sum(n))
+}
+```
+
+```{r}
+# Fit lda models
+lda_fits <- heart_db %>% 
+  mutate(mod_01 = map(train, ~ lda(formula = target ~ .,
+                                   data = .x)),
+         mod_02 = map(train, ~ lda(formula = target ~ age + sex + cp + thalach + exang + oldpeak,
+                                   data = .x)),
+         mod_03 = map(train, ~ lda(formula = target ~ sex + cp + restecg + exang + oldpeak + slope + ca 
+                                   + thal, data = .x))) %>% 
+  pivot_longer(cols = contains("mod_"), names_to = "model_name", values_to = "model_fit")
+
+# update lda_fits with error and confusion info
+lda_fits <- lda_fits %>% 
+  mutate(train_error = map2_dbl(train, model_fit, error_rate_lda),
+         test_error  = map2_dbl(test, model_fit, error_rate_lda),
+         test_confusion = map2(test, model_fit, confusion_mat_lda))  
+  
+# Compare models by test_error
+lda_fits %>% 
+  dplyr::select(model_name, train_error, test_error) %>% 
+  arrange(test_error) %>% 
+  knitr::kable()
+```
+
+```{r}
+# Get confusion matrix for best model
+lda_fits %>% 
+  filter(model_name == "mod_02") %>% 
+  unnest(test_confusion) 
+```
+
+
+### QDA Model
+
+Similar to LDA, Model 2 with theoretically important variables explored in EDA produced the smallest test error of 0.20 (slighly smaller than the rest of models) using QDA. The confusion matrix shows that the model is generally good at predicting patients with heart disease with (10/11 cases) but still tends to over-estimate the patients who do not have heart disease as they do (5/19).
+
+```{r}
+# Helper function for calculating qda error rate 
+error_rate_qda <- function(data, model){
+  data %>% 
+    mutate(pred_target = predict(model, newdata = data) %>% 
+             pluck("class"),
+           error = pred_target != target) %>% 
+    pull(error) %>% 
+    mean()
+}
+
+# Helper function for qda confusion matrix
+confusion_mat_qda <- function(data, model){
+  data %>% 
+    mutate(pred_target = predict(model, newdata = data) %>% 
+             pluck("class")) %>% 
+    count(target, pred_target, .drop = FALSE) %>% 
+    mutate(prop = n / sum(n))
+}
+```
+
+```{r}
+# Fit qda models
+qda_fits <- heart_db %>% 
+  mutate(mod_01 = map(train, ~ qda(formula = target ~ .,
+                                   data = .x)),
+         mod_02 = map(train, ~ qda(formula = target ~ age + sex + cp + thalach + exang + oldpeak,
+                                   data = .x)),
+         mod_03 = map(train, ~ qda(formula = target ~ sex + cp + restecg + exang + oldpeak + slope + ca 
+                                   + thal, data = .x))) %>% 
+  pivot_longer(cols =  contains("mod_"), names_to = "model_name", values_to = "model_fit")
+
+# update qda_fits with error and confusion info
+qda_fits <- qda_fits %>% 
+  mutate(train_error = map2_dbl(train, model_fit, error_rate_qda),
+         test_error  = map2_dbl(test, model_fit, error_rate_qda),
+         test_confusion = map2(test, model_fit, confusion_mat_qda))  
+  
+# Compare models by test_error
+qda_fits %>% 
+  dplyr::select(model_name, train_error, test_error) %>% 
+  arrange(test_error) %>% 
+  knitr::kable()
+```
+
+```{r}
+# Get confusion matrix for best model
+qda_fits %>% 
+  filter(model_name == "mod_02") %>% 
+  unnest(test_confusion) 
+```
+
+---
+
+## New models with modified variables
+
+Since the result from models so far tends to favor the theortically important variables from EDA, I decide to further improve this model by imputing new `age` and `cp` variables from observations in EDA. I learned that `age` makes more sense as a categorical variable with 5 cuts providing that we have limited data and thus minimal observations for each discrete value for a continuous variable. The presence of chest pain as well, shows an increased proportion of patients with heart disease regardless of its types; thus I will store `cp` as a categorical variable simply noting the presence (1) or absence (0) of chest pain.
+
+### Tibble set-up
+```{r}
+heart2 <- rbind(train, test) %>% 
+  mutate(
+    age = as.ordered(cut(age, 5)),
+    cp = as.factor(ifelse(cp == 0, 0, 1))
+  )
+
+train2 <- heart2 %>% 
+  sample_frac(0.90)
+
+test2 <- heart2 %>% 
+  setdiff(train2)
+
+heart_db2 <- tibble(
+  train = train2 %>% list(),
+  test = test2 %>% list())
+```
+
+### Generalized Linear Model
+
+Now, we begin to see the difference of these imputed variables, the result, models 1 and 3 produce the smallest test error of 0.10 using generalized linear model, more than 10% improvement from previous models; I will favor model 3 here more such that it uses only a subset of all the variables form model 1.
+
+```{r}
+glm_fits2 <- heart_db2 %>% 
+  mutate(mod_01 = map(train, glm, 
+                      formula = target ~ .,
+                      family = binomial),
+         mod_02 = map(train, glm, 
+                      formula = target ~ age + sex + cp + thalach + exang + oldpeak,
+                      family = binomial),
+         mod_03 = map(train, glm, 
+                      formula = target ~ sex + cp + restecg + exang + oldpeak + slope + ca + thal,
+                      family = binomial)) %>% 
+  pivot_longer(cols = contains("mod_"), names_to = "model_name", values_to =  "model_fit")
+
+# Calculate model error
+glm_fits2 <- glm_fits2 %>% 
+  mutate(train_error = map2_dbl(train, model_fit, error_rate_glm),
+         test_error  = map2_dbl(test, model_fit, error_rate_glm),
+         test_confusion = map2(test, model_fit, confusion_mat_glm))  
+  
+glm_fits2 %>% 
+  select(model_name, train_error, test_error) %>% 
+  # select_if(~ !is_list(.)) %>% 
+  arrange(test_error) %>% 
+  knitr::kable()
+```
+
+### LDA
+
+Similarily, models 1 and 3 produces the smallest test error of 0.10, and from the confusion matrix, we see much fewer over-estimation for patient without heart disease to be predicted as presence (1/12).
+
+```{r}
+# Fit lda models
+lda_fits2 <- heart_db2 %>% 
+  mutate(mod_01 = map(train, ~ lda(formula = target ~ .,
+                                   data = .x)),
+         mod_02 = map(train, ~ lda(formula = target ~ age + sex + cp + thalach + exang + oldpeak,
+                                   data = .x)),
+         mod_03 = map(train, ~ lda(formula = target ~ sex + cp + restecg + exang + oldpeak + slope + ca 
+                                   + thal, data = .x))) %>% 
+  pivot_longer(cols = contains("mod_"), names_to = "model_name", values_to = "model_fit")
+
+# update lda_fits with error and confusion info
+lda_fits2 <- lda_fits2 %>% 
+  mutate(train_error = map2_dbl(train, model_fit, error_rate_lda),
+         test_error  = map2_dbl(test, model_fit, error_rate_lda),
+         test_confusion = map2(test, model_fit, confusion_mat_lda))  
+  
+# Compare models by test_error
+lda_fits2 %>% 
+  select(model_name, train_error, test_error) %>% 
+  arrange(test_error) %>% 
+  knitr::kable()
+```
+
+```{r}
+# Get confusion matrix for best model
+lda_fits2 %>% 
+  filter(model_name == "mod_03") %>% 
+  unnest(test_confusion)
+```
+
+### QDA
+
+However, QDA shows that the same result for models 1 and 3 with the test error of 0.10, and the same  confusion matrix as using LDA.
+
+```{r}
+# Fit qda models
+qda_fits2 <- heart_db2 %>% 
+  mutate(mod_01 = map(train, ~ qda(formula = target ~ .,
+                                   data = .x)),
+         mod_02 = map(train, ~ qda(formula = target ~ age + sex + cp + thalach + exang + oldpeak,
+                                   data = .x)),
+         mod_03 = map(train, ~ qda(formula = target ~ sex + cp + restecg + exang + oldpeak + slope + ca 
+                                   + thal, data = .x))) %>% 
+  pivot_longer(cols =  contains("mod_"), names_to = "model_name", values_to = "model_fit")
+
+# update qda_fits with error and confusion info
+qda_fits2 <- qda_fits2 %>% 
+  mutate(train_error = map2_dbl(train, model_fit, error_rate_qda),
+         test_error  = map2_dbl(test, model_fit, error_rate_qda),
+         test_confusion = map2(test, model_fit, confusion_mat_qda))  
+  
+# Compare models by test_error
+qda_fits2 %>% 
+  select(model_name, train_error, test_error) %>% 
+  arrange(test_error) %>% 
+  knitr::kable()
+```
+
+```{r}
+# Get confusion matrix for best model
+qda_fits2 %>% 
+  filter(model_name == "mod_03") %>% 
+  unnest(test_confusion) 
+```
+
+## Conclusion
+
+From model building, we see LDA and QDA models provide the most effective fit for our data producing lowest test error than other methods explored. From imputing the `age` and `cp` variables as categorical, we improve the model from lowest test error of 0.20 to 0.10. A next step will be continue exploring the possible imputation for other variables such as `slope`, `ca`, and `thal` and their effect on the models. In the future as we learn more classification models, we can apply more methods such as random forest to see if we can improve the result a lot more. The variables selected by ridge and lasso fits the best for most models explored here.
+
+---
+
+## Appendix (EDA)
+
+1. Read processed EDA dataset
+```{r Read processed datasets}
+# Read processed dataset
+heart <- read_csv(
+  "data/processed/heart_eda.csv",
+  col_types = cols(
+    age = col_double(),
+    sex = col_factor(),
+    cp = col_factor(),
+    trestbps = col_double(),
+    chol = col_double(),
+    fbs = col_factor(),
+    restecg = col_factor(),
+    thalach = col_double(),
+    exang = col_factor(),
+    oldpeak = col_double(),
+    slope = col_factor(),
+    ca = col_factor(),
+    thal = col_factor(),
+    target = col_factor()
+  ))
+```
+
+2. View percentage of missing values for each column after cleaning
+```{r View percentage of missing values for each column, message=FALSE, warning=FALSE}
+# View percentage of missing values for each column
+heart %>% 
+  summarise_all(funs(
+    sum(is.na(.)) / length(.)
+    ))
+```
+We have no missing values for all columns.
+
+### Explore Patient Personal Information
+
+#### Patient Age
+
+From bar chart, we see a larger proportion of observations in age group (42.5, 50.8] diagnosed with heart disease (9/9). While the proportion of presence in heart disease is lowest for age group (50.8, 67.6].
+```{r Heart Disease Frequency for Ages}
+# Time between creating an account to booking
+age_cut_heart <- heart %>% 
+  mutate(age_cut = cut(age, 5)) %>% 
+  group_by(age_cut) 
+
+age_cut_heart %>% 
+  summarise( 
+    count = n(),
+    freq = sum(ifelse(target == 1, 1, 0)),
+    prop = freq/count
+  ) %>% 
+  ggplot(aes(x = age_cut, y = prop)) +
+  geom_histogram(stat = "identity") +
+  labs(title = "Heart Disease Frequency for Age", y = "Proportion diagnosed with heart disease", x = "Age")
+```
+
+#### Sex
+
+From bar chart, we see a larger proportion of observations in female diagnosed with heart disease (17/23). While the proportion of presence in heart disease in male is much lower.
+
+```{r Heart Disease Frequency for Sex}
+heart %>% 
+  group_by(sex) %>% 
+  summarise( 
+    count = n(),
+    freq = sum(ifelse(target == 1, 1, 0)),
+    prop = freq/count
+  ) %>% 
+  ggplot(aes(x = sex, y = prop)) +
+  geom_histogram(stat = "identity") +
+  labs(title = "Heart Disease Frequency for Sex", y = "Proportion diagnosed with heart disease", x = "Sex")
+```
+
+### Patient Health Conditions
+
+#### Chest Pain Types
+
+From the simple bar chart below, we can see that there is a seemingly significant decrease in porportion of diagnosed cases for patients that does not show ANY syndrome of chest pain. Thus, we hypothesize that the presence and types of chest pain is probably important in predicting the presence of heart disease.
+
+```{r Proportion of age, warning=FALSE}
+# View proportion of age after replacing outliers with median age value.
+heart %>% 
+  select(cp, target) %>% 
+  group_by(cp) %>% 
+  summarise(
+    count = n(),
+    prop = sum(ifelse(target == 1, 1, 0))/count
+  ) %>% 
+  ggplot(aes(x = cp, y = prop)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Heart Disease Frequency for Chest Pain Type", y = "Proportion diagnosed with heart disease", x = "Chest Pain Type")
+```
+
+#### Maximum Heart Rate
+
+From the boxplot, a higher maximum heart rate seems to correlate with the presence of heart disease.
+
+```{r Maximum Heart Rate}
+heart %>% 
+  ggplot(aes(x = target, y = thalach)) +
+  geom_boxplot() +
+  labs(title = "Heart Disease Maximum Heart Rate", y = "Maximum Heart Rate", x = "Presence (1) of Heart Disease")
+```
+
+#### ST depression induced by exercise
+
+From the boxplot, the absence of ST depression seems to correlate with the presence of heart disease. This variable might indicates a malfunction of heart manifested in exercising tests.
+
+```{r ST depression induced by exercise}
+heart %>% 
+  ggplot(aes(x = target, y = oldpeak)) +
+  geom_boxplot() +
+  labs(title = "ST depression and Heart Disease", y = "ST depression induced by exercise", x = "Presence (1) of Heart Disease")
+```
+
+#### Exercise-induced angina
+
+From the boxplot, the absence of angina during exercise seems to correlate with the presence of heart disease. This variable might again indicates a malfunction of heart manifested in exercising tests.
+
+```{r Exercise-induced angina}
+heart %>% 
+  group_by(fbs) %>% 
+  summarise( 
+    count = n(),
+    freq = sum(ifelse(target == 1, 1, 0)),
+    prop = freq/count
+  ) %>% 
+  ggplot(aes(x = fbs, y = prop)) +
+  geom_histogram(stat = "identity") +
+  labs(title = "Heart Disease Frequency for Exercise-induced angina", y = "Proportion diagnosed with heart disease", x = "Presence of Exercise-induced angina")
+```
